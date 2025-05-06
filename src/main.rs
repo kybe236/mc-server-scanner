@@ -1,0 +1,376 @@
+use std::{
+    cmp::Ordering,
+    io::{Error, ErrorKind, Result},
+    net::Ipv4Addr,
+    sync::Arc,
+    time::Duration,
+};
+
+use chrono::Local;
+use ipnetwork::Ipv4Network;
+use rand::{Rng, distr::Alphanumeric};
+use serde::Deserialize;
+use serde_json::Value;
+use string::{read_string, write_string};
+use tokio::{
+    fs::File,
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::TcpStream,
+    sync::mpsc,
+    time::timeout,
+};
+use tokio_socks::tcp::Socks5Stream;
+use tracing::{error, info};
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::{fmt, layer::SubscriberExt};
+use u16::write_u16;
+use varint::{read_var_int, write_var_int};
+
+mod string;
+mod u16;
+mod varint;
+
+#[derive(Deserialize, Clone)]
+struct Settings {
+    cidr: String,
+    exclude_file: String,
+    worker_count: usize,
+    connection_timeout_secs: u64,
+    use_tor: bool,
+}
+
+async fn read_exclude_list(path: &str) -> Result<Vec<(u32, u32)>> {
+    let mut ranges = Vec::new();
+    let file = File::open(path).await?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some((start_str, end_str)) = line.split_once('-') {
+            if let (Ok(start), Ok(end)) =
+                (start_str.parse::<Ipv4Addr>(), end_str.parse::<Ipv4Addr>())
+            {
+                let start_u32 = u32::from(start);
+                let end_u32 = u32::from(end);
+                if start_u32 <= end_u32 {
+                    ranges.push((start_u32, end_u32));
+                }
+            }
+        } else if let Ok(network) = line.parse::<Ipv4Network>() {
+            let start = u32::from(network.network());
+            let size = network.size();
+            let end = start + (size - 1) as u32;
+            ranges.push((start, end));
+        } else {
+            error!("Invalid network format: {}", line);
+        }
+    }
+
+    merge_ranges(&mut ranges);
+    Ok(ranges)
+}
+
+fn merge_ranges(ranges: &mut Vec<(u32, u32)>) {
+    if ranges.is_empty() {
+        return;
+    }
+
+    ranges.sort_unstable_by_key(|&(start, _)| start);
+
+    let mut merged = vec![ranges[0]];
+    for &(start, end) in ranges.iter().skip(1) {
+        let last = merged.last_mut().unwrap();
+        if start <= last.1.saturating_add(1) {
+            if end > last.1 {
+                last.1 = end;
+            }
+        } else {
+            merged.push((start, end));
+        }
+    }
+
+    *ranges = merged;
+}
+
+fn ip_in_excludes(ip: Ipv4Addr, merged_ranges: &[(u32, u32)]) -> bool {
+    let ip_u32 = u32::from(ip);
+
+    // Binary search to find the right range
+    let mut left = 0;
+    let mut right = merged_ranges.len() - 1;
+
+    while left <= right {
+        let mid = (left + right) / 2;
+        let (start, end) = merged_ranges[mid];
+
+        match ip_u32.cmp(&start) {
+            Ordering::Less => {
+                right = mid - 1;
+            }
+            Ordering::Greater => {
+                left = mid + 1;
+            }
+            Ordering::Equal => return true, // If it's exactly the start of a range, it's excluded
+        }
+
+        if ip_u32 >= start && ip_u32 <= end {
+            return true; // If it's in the current range
+        }
+    }
+
+    false
+}
+
+#[tokio::main]
+async fn main() {
+    let file_appender = RollingFileAppender::new(Rotation::HOURLY, "./logs", "app.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    let subscriber = tracing_subscriber::registry()
+        .with(fmt::layer().with_ansi(true))
+        .with(fmt::layer().with_writer(non_blocking).with_ansi(false));
+
+    tracing::subscriber::set_global_default(subscriber).ok();
+
+    // Load settings
+    let settings = match load_settings("settings.json").await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to load settings: {}", e);
+            return;
+        }
+    };
+
+    // Parse CIDR
+    let network: Ipv4Network = match settings.cidr.parse() {
+        Ok(net) => net,
+        Err(_) => {
+            error!("Invalid CIDR: {}", settings.cidr);
+            return;
+        }
+    };
+
+    // Read exclude ranges
+    let exclude_ranges = match read_exclude_list(&settings.exclude_file).await {
+        Ok(ranges) => ranges,
+        Err(e) => {
+            error!("Failed to read exclude file: {}", e);
+            Vec::new()
+        }
+    };
+    let exclude_ranges = Arc::new(exclude_ranges);
+
+    // Create a bounded channel
+    let (tx, rx) = mpsc::channel::<Ipv4Addr>(settings.worker_count * 2);
+
+    // Producer task
+    let exclude_ranges_clone = Arc::clone(&exclude_ranges);
+    let producer_handle = tokio::spawn(async move {
+        for ip in network.iter() {
+            if ip_in_excludes(ip, &exclude_ranges_clone) {
+                continue;
+            }
+            if tx.send(ip).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Consumer (worker) tasks
+    let worker_handle = {
+        let settings = settings.clone();
+        tokio::spawn(async move {
+            let mut handles = Vec::new();
+            let rx = Arc::new(tokio::sync::Mutex::new(rx)); // share receiver safely
+
+            for _ in 0..settings.worker_count {
+                let rx = Arc::clone(&rx);
+                let settings = settings.clone();
+                let handle = tokio::spawn(async move {
+                    loop {
+                        let ip = {
+                            let mut guard = rx.lock().await;
+                            guard.recv().await
+                        };
+                        match ip {
+                            Some(ip) => {
+                                let addr = format!("{}:25565", ip);
+                                info!("Connecting to {}", addr);
+                                let timeout_dur =
+                                    Duration::from_secs(settings.connection_timeout_secs);
+                                let mut stream =
+                                    match connect(ip, 25565, settings.use_tor, timeout_dur).await {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            error!("{}: Connect error: {}", addr, e);
+                                            continue;
+                                        }
+                                    };
+
+                                let handshake =
+                                    create_handshake_packet(757, &ip.to_string(), 25565, 1).await;
+                                if timeout(timeout_dur, stream.write_all(&handshake))
+                                    .await
+                                    .is_err()
+                                {
+                                    error!("{}: Handshake write timeout", addr);
+                                    continue;
+                                }
+
+                                let status = create_status_request().await;
+                                if timeout(timeout_dur, stream.write_all(&status))
+                                    .await
+                                    .is_err()
+                                {
+                                    error!("{}: Status write timeout", addr);
+                                    continue;
+                                }
+
+                                let len = match timeout(
+                                    timeout_dur,
+                                    varint::read_var_int_from_stream(&mut stream),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(l)) => l,
+                                    _ => {
+                                        error!("{}: Response length read failed", addr);
+                                        continue;
+                                    }
+                                };
+
+                                let mut buffer = vec![0; len as usize];
+                                if timeout(timeout_dur, stream.read_exact(&mut buffer))
+                                    .await
+                                    .is_err()
+                                {
+                                    error!("{}: Read response timeout", addr);
+                                    continue;
+                                }
+
+                                let mut index = 0;
+                                let code = read_var_int(&buffer, Some(&mut index));
+                                let response = read_string(&buffer, &mut index);
+                                info!("{}: Code {:?}, Response {:?}", addr, code, response);
+                                let res =
+                                    save_json_to_file(&addr, &response.unwrap_or_default()).await;
+                                if let Err(e) = res {
+                                    error!("{}: Failed to save response: {}", addr, e);
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                });
+                handles.push(handle);
+            }
+
+            // Wait for all worker tasks
+            for h in handles {
+                let _ = h.await;
+            }
+        })
+    };
+
+    // Wait for both tasks
+    let _ = producer_handle.await;
+    let _ = worker_handle.await;
+}
+
+async fn save_json_to_file(addr: &str, json_str: &str) -> Result<()> {
+    let parsed: Value = serde_json::from_str(json_str)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Invalid JSON: {}", e)))?;
+
+    let formatted = serde_json::to_string_pretty(&parsed)
+        .map_err(|e| Error::new(ErrorKind::Other, format!("Failed to format JSON: {}", e)))?;
+
+    // Use current local time for filename.
+    let now = Local::now();
+    let filename = format!("res/{}-{}.json", addr, now.format("%Y-%m-%d-%H-%M-%S"));
+
+    let mut file = File::create(&filename).await?;
+    file.write_all(formatted.as_bytes()).await?;
+    file.flush().await?;
+
+    info!("Saved response to {}", filename);
+    Ok(())
+}
+
+async fn create_handshake_packet(
+    protocol_version: i32,
+    server_address: &str,
+    server_port: u16,
+    next_state: i32,
+) -> Vec<u8> {
+    let mut outer = Vec::new();
+    let mut inner = Vec::new();
+    write_var_int(&mut inner, &0x0);
+    write_var_int(&mut inner, &protocol_version);
+    write_string(&mut inner, server_address);
+    write_u16(&mut inner, server_port);
+    write_var_int(&mut inner, &next_state);
+    write_var_int(&mut outer, &(inner.len() as i32));
+    outer.extend_from_slice(&inner);
+    outer
+}
+
+async fn create_status_request() -> Vec<u8> {
+    let mut outer = Vec::new();
+    let mut inner = Vec::new();
+    write_var_int(&mut inner, &0x0);
+    write_var_int(&mut outer, &(inner.len() as i32));
+    outer.extend_from_slice(&inner);
+    outer
+}
+
+async fn connect(
+    ip: Ipv4Addr,
+    port: u16,
+    via_tor: bool,
+    timeout_dur: Duration,
+) -> Result<TcpStream> {
+    let addr = format!("{}:{}", ip, port);
+
+    if via_tor {
+        let proxy = "127.0.0.1:9050";
+        let user: String = rand::rng()
+            .sample_iter(&Alphanumeric)
+            .take(8)
+            .map(char::from)
+            .collect();
+        let pass: String = rand::rng()
+            .sample_iter(&Alphanumeric)
+            .take(12)
+            .map(char::from)
+            .collect();
+        let res = timeout(
+            timeout_dur,
+            Socks5Stream::connect_with_password(proxy, addr, &user, &pass),
+        )
+        .await;
+        match res {
+            Ok(Ok(s)) => Ok(s.into_inner()),
+            Ok(Err(e)) => Err(Error::new(ErrorKind::Other, format!("SOCKS5 error: {}", e))),
+            Err(_) => Err(Error::new(ErrorKind::TimedOut, "SOCKS5 timeout")),
+        }
+    } else {
+        match timeout(timeout_dur, TcpStream::connect(&addr)).await {
+            Ok(Ok(s)) => Ok(s),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(Error::new(ErrorKind::TimedOut, "TCP connect timeout")),
+        }
+    }
+}
+
+async fn load_settings(path: &str) -> Result<Settings> {
+    let file = File::open(path).await?;
+    let mut reader = BufReader::new(file);
+    let mut contents = String::new();
+    reader.read_to_string(&mut contents).await?;
+    serde_json::from_str(&contents).map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))
+}

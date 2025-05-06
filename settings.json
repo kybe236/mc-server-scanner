@@ -1,0 +1,7 @@
+{
+    "cidr": "0.0.0.0/0",
+    "exclude_file": "exclude.conf",
+    "worker_count": 150,
+    "connection_timeout_secs": 1,
+    "use_tor": true
+}
