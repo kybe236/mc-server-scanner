@@ -97,33 +97,19 @@ fn merge_ranges(ranges: &mut Vec<(u32, u32)>) {
     *ranges = merged;
 }
 
-fn ip_in_excludes(ip: Ipv4Addr, merged_ranges: &[(u32, u32)]) -> bool {
+fn ip_in_excludes(ip: Ipv4Addr, ranges: &[(u32, u32)]) -> bool {
     let ip_u32 = u32::from(ip);
-
-    // Binary search to find the right range
-    let mut left = 0;
-    let mut right = merged_ranges.len() - 1;
-
-    while left <= right {
-        let mid = (left + right) / 2;
-        let (start, end) = merged_ranges[mid];
-
-        match ip_u32.cmp(&start) {
-            Ordering::Less => {
-                right = mid - 1;
+    ranges
+        .binary_search_by(|&(start, end)| {
+            if ip_u32 < start {
+                Ordering::Greater
+            } else if ip_u32 > end {
+                Ordering::Less
+            } else {
+                Ordering::Equal
             }
-            Ordering::Greater => {
-                left = mid + 1;
-            }
-            Ordering::Equal => return true, // If it's exactly the start of a range, it's excluded
-        }
-
-        if ip_u32 >= start && ip_u32 <= end {
-            return true; // If it's in the current range
-        }
-    }
-
-    false
+        })
+        .is_ok()
 }
 
 #[tokio::main]
@@ -145,6 +131,9 @@ async fn main() {
             return;
         }
     };
+
+    let last_ip_path = "last_ip.txt";
+    let last_ip = read_last_ip(last_ip_path).await;
 
     // Parse CIDR
     let network: Ipv4Network = match settings.cidr.parse() {
@@ -171,7 +160,13 @@ async fn main() {
     // Producer task
     let exclude_ranges_clone = Arc::clone(&exclude_ranges);
     let producer_handle = tokio::spawn(async move {
+        let skip = last_ip.map(u32::from);
         for ip in network.iter() {
+            if let Some(skip_to) = skip {
+                if u32::from(ip) < skip_to {
+                    continue;
+                }
+            }
             if ip_in_excludes(ip, &exclude_ranges_clone) {
                 continue;
             }
@@ -203,6 +198,7 @@ async fn main() {
                                 info!("Connecting to {}", addr);
                                 let timeout_dur =
                                     Duration::from_secs(settings.connection_timeout_secs);
+                                write_last_ip("last_ip.txt", ip).await;
                                 let mut stream =
                                     match connect(ip, 25565, settings.use_tor, timeout_dur).await {
                                         Ok(s) => s,
@@ -373,4 +369,25 @@ async fn load_settings(path: &str) -> Result<Settings> {
     let mut contents = String::new();
     reader.read_to_string(&mut contents).await?;
     serde_json::from_str(&contents).map_err(|e| Error::new(ErrorKind::InvalidData, e.to_string()))
+}
+
+async fn read_last_ip(path: &str) -> Option<Ipv4Addr> {
+    match File::open(path).await {
+        Ok(mut file) => {
+            let mut contents = String::new();
+            if file.read_to_string(&mut contents).await.is_ok() {
+                contents.trim().parse().ok()
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+async fn write_last_ip(path: &str, ip: Ipv4Addr) {
+    if let Ok(mut file) = File::create(path).await {
+        let _ = file.write_all(ip.to_string().as_bytes()).await;
+        let _ = file.flush().await;
+    }
 }
