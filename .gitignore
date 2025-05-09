@@ -1,1 +1,3 @@
-/target
+target
+res/*
+last_ip.txt

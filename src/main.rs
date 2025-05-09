@@ -2,6 +2,7 @@ use std::{
     cmp::Ordering,
     io::{Error, ErrorKind, Result},
     net::Ipv4Addr,
+    path::Path,
     sync::Arc,
     time::Duration,
 };
@@ -13,7 +14,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use string::{read_string, write_string};
 use tokio::{
-    fs::File,
+    fs::{self, File},
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
     sync::mpsc,
@@ -21,7 +22,6 @@ use tokio::{
 };
 use tokio_socks::tcp::Socks5Stream;
 use tracing::{error, info};
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt};
 use u16::write_u16;
 use varint::{read_var_int, write_var_int};
@@ -37,6 +37,8 @@ struct Settings {
     worker_count: usize,
     connection_timeout_secs: u64,
     use_tor: bool,
+    validate: bool,
+    validate_worker_count: usize,
 }
 
 async fn read_exclude_list(path: &str) -> Result<Vec<(u32, u32)>> {
@@ -79,11 +81,10 @@ fn merge_ranges(ranges: &mut Vec<(u32, u32)>) {
     if ranges.is_empty() {
         return;
     }
-
     ranges.sort_unstable_by_key(|&(start, _)| start);
 
     let mut merged = vec![ranges[0]];
-    for &(start, end) in ranges.iter().skip(1) {
+    for &(start, end) in &ranges[1..] {
         let last = merged.last_mut().unwrap();
         if start <= last.1.saturating_add(1) {
             if end > last.1 {
@@ -114,12 +115,7 @@ fn ip_in_excludes(ip: Ipv4Addr, ranges: &[(u32, u32)]) -> bool {
 
 #[tokio::main]
 async fn main() {
-    let file_appender = RollingFileAppender::new(Rotation::HOURLY, "./logs", "app.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-
-    let subscriber = tracing_subscriber::registry()
-        .with(fmt::layer().with_ansi(true))
-        .with(fmt::layer().with_writer(non_blocking).with_ansi(false));
+    let subscriber = tracing_subscriber::registry().with(fmt::layer().with_ansi(true));
 
     tracing::subscriber::set_global_default(subscriber).ok();
 
@@ -161,17 +157,31 @@ async fn main() {
     let exclude_ranges_clone = Arc::clone(&exclude_ranges);
     let producer_handle = tokio::spawn(async move {
         let skip = last_ip.map(u32::from);
-        for ip in network.iter() {
+        let network_start = u32::from(network.network());
+        let network_end = network_start + network.size() as u32 - 1;
+
+        let mut ip = network_start;
+
+        loop {
             if let Some(skip_to) = skip {
-                if u32::from(ip) < skip_to {
+                if ip < skip_to {
+                    ip += 1;
                     continue;
                 }
             }
-            if ip_in_excludes(ip, &exclude_ranges_clone) {
+            if ip_in_excludes(Ipv4Addr::from(ip), &exclude_ranges_clone) {
+                ip += 1;
                 continue;
             }
-            if tx.send(ip).await.is_err() {
+            if tx.send(Ipv4Addr::from(ip)).await.is_err() {
                 break;
+            }
+
+            // Increment IP for the next iteration
+            if ip == network_end {
+                ip = network_start - 1; // Reset to the start if we've reached the end
+            } else {
+                ip += 1;
             }
         }
     });
@@ -194,70 +204,9 @@ async fn main() {
                         };
                         match ip {
                             Some(ip) => {
-                                let addr = format!("{}:25565", ip);
-                                info!("Connecting to {}", addr);
-                                let timeout_dur =
-                                    Duration::from_secs(settings.connection_timeout_secs);
-                                write_last_ip("last_ip.txt", ip).await;
-                                let mut stream =
-                                    match connect(ip, 25565, settings.use_tor, timeout_dur).await {
-                                        Ok(s) => s,
-                                        Err(e) => {
-                                            error!("{}: Connect error: {}", addr, e);
-                                            continue;
-                                        }
-                                    };
-
-                                let handshake =
-                                    create_handshake_packet(757, &ip.to_string(), 25565, 1).await;
-                                if timeout(timeout_dur, stream.write_all(&handshake))
-                                    .await
-                                    .is_err()
-                                {
-                                    error!("{}: Handshake write timeout", addr);
-                                    continue;
-                                }
-
-                                let status = create_status_request().await;
-                                if timeout(timeout_dur, stream.write_all(&status))
-                                    .await
-                                    .is_err()
-                                {
-                                    error!("{}: Status write timeout", addr);
-                                    continue;
-                                }
-
-                                let len = match timeout(
-                                    timeout_dur,
-                                    varint::read_var_int_from_stream(&mut stream),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(l)) => l,
-                                    _ => {
-                                        error!("{}: Response length read failed", addr);
-                                        continue;
-                                    }
-                                };
-
-                                let mut buffer = vec![0; len as usize];
-                                if timeout(timeout_dur, stream.read_exact(&mut buffer))
-                                    .await
-                                    .is_err()
-                                {
-                                    error!("{}: Read response timeout", addr);
-                                    continue;
-                                }
-
-                                let mut index = 0;
-                                let code = read_var_int(&buffer, Some(&mut index));
-                                let response = read_string(&buffer, &mut index);
-                                info!("{}: Code {:?}, Response {:?}", addr, code, response);
-                                let res =
-                                    save_json_to_file(&addr, &response.unwrap_or_default()).await;
-                                if let Err(e) = res {
-                                    error!("{}: Failed to save response: {}", addr, e);
-                                }
+                                check_ip(ip, &settings).await.unwrap_or_else(|e| {
+                                    error!("Error checking IP {}: {}", ip, e);
+                                });
                             }
                             None => break,
                         }
@@ -273,25 +222,116 @@ async fn main() {
         })
     };
 
+    if settings.validate {
+        let validate_handles = tokio::spawn(async move {
+            let mut handles = Vec::new();
+            for i in 0..settings.validate_worker_count {
+                let s = settings.clone();
+                handles.push(tokio::spawn(validate_worker(i, s.validate_worker_count, s)));
+            }
+            for h in handles {
+                let _ = h.await;
+            }
+        });
+        let _ = validate_handles.await;
+    }
+
     // Wait for both tasks
     let _ = producer_handle.await;
     let _ = worker_handle.await;
 }
 
-async fn save_json_to_file(addr: &str, json_str: &str) -> Result<()> {
+async fn check_ip(ip: Ipv4Addr, settings: &Settings) -> Result<()> {
+    let addr = format!("{}:25565", ip);
+    info!("Connecting to {}", addr);
+    let timeout_dur = Duration::from_secs(settings.connection_timeout_secs);
+    write_last_ip("last_ip.txt", ip).await;
+    let mut stream = connect(ip, 25565, settings.use_tor, timeout_dur).await?;
+
+    let handshake = create_handshake_packet(757, &ip.to_string(), 25565, 1).await;
+    stream.write_all(&handshake).await?;
+
+    let status = create_status_request().await;
+    stream.write_all(&status).await?;
+
+    let len = varint::read_var_int_from_stream(&mut stream).await?;
+    let mut buffer = vec![0; len as usize];
+    stream.read_exact(&mut buffer).await?;
+
+    let mut index = 0;
+    let code = read_var_int(&buffer, Some(&mut index));
+    let response = read_string(&buffer, &mut index);
+    info!("{}: Code {:?}, Response {:?}", addr, code, response);
+
+    save_json_to_file(&addr, &response.unwrap_or_default()).await
+}
+
+async fn validate_worker(id: usize, total: usize, settings: Settings) {
+    loop {
+        let dir = match fs::read_dir("res").await {
+            Ok(d) => d,
+            Err(e) => {
+                error!("Validator {} failed to read ./res: {}", id, e);
+                return;
+            }
+        };
+
+        tokio::pin!(dir);
+        while let Some(entry) = dir.next_entry().await.unwrap_or(None) {
+            info!(
+                "Validator {}: checking {}",
+                id,
+                entry.file_name().to_string_lossy()
+            );
+            let folder = entry.file_name().to_string_lossy().into_owned();
+
+            let sum: usize = folder.bytes().map(|b| b as usize).sum();
+            if sum % total != id {
+                continue;
+            }
+
+            let ip = *folder.split(":").collect::<Vec<&str>>().get(0).unwrap();
+            let ip: Ipv4Addr = match ip.parse() {
+                Ok(ip) => ip,
+                Err(e) => {
+                    error!("Validator {}: invalid IP {}: {}", id, ip, e);
+                    continue;
+                }
+            };
+
+            check_ip(ip, &settings).await.unwrap_or_else(|e: Error| {
+                error!("Validator {}: error checking IP {}: {}", id, folder, e);
+            });
+        }
+    }
+}
+
+pub async fn save_json_to_file(addr: &str, json_str: &str) -> Result<()> {
     let parsed: Value = serde_json::from_str(json_str)
         .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Invalid JSON: {}", e)))?;
 
     let formatted = serde_json::to_string_pretty(&parsed)
         .map_err(|e| Error::new(ErrorKind::Other, format!("Failed to format JSON: {}", e)))?;
 
-    // Use current local time for filename.
-    let now = Local::now();
-    let filename = format!("res/{}-{}.json", addr, now.format("%Y-%m-%d-%H-%M-%S"));
+    let foldername = format!("res/{}", addr);
+    let dir = Path::new(&foldername);
+    if !dir.exists() {
+        fs::create_dir_all(dir).await?;
+    }
 
+    let now = Local::now();
+    let filename = format!("{}/{}.json", foldername, now.format("%Y-%m-%d_%H-%M-%S"));
+    let latest_filename = format!("{}/latest.json", foldername);
+
+    // Write the timestamped file
     let mut file = File::create(&filename).await?;
     file.write_all(formatted.as_bytes()).await?;
     file.flush().await?;
+
+    // Also write the latest.json file
+    let mut latest_file = File::create(&latest_filename).await?;
+    latest_file.write_all(formatted.as_bytes()).await?;
+    latest_file.flush().await?;
 
     info!("Saved response to {}", filename);
     Ok(())
