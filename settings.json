@@ -1,9 +1,9 @@
 {
     "use_tor": false,
-    "cidr": "1.92.114.92/32",
+    "cidr": "4.0.0.0/0",
     "exclude_file": "exclude.conf",
-    "worker_count": 1,
+    "worker_count": 2000,
     "connection_timeout_secs": 10,
-    "validate": true,
+    "validate": false,
     "validate_worker_count": 1
 }

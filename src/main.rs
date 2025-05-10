@@ -26,6 +26,7 @@ use tokio_socks::tcp::Socks5Stream;
 use tracing::{error, info};
 use tracing_subscriber::{fmt, layer::SubscriberExt};
 use u16::write_u16;
+use uuid::Uuid;
 use varint::{read_var_int, write_var_int};
 
 mod string;
@@ -476,15 +477,33 @@ pub async fn save_json(
     if let Some(players) = &players {
         if let Some(sample) = &players.sample {
             for player in sample {
+                if player.name.is_none() || player.id.is_none() {
+                    continue;
+                }
+                let id = get_user_id(
+                    &client,
+                    &player.name.clone().unwrap(),
+                    &player.id.clone().unwrap(),
+                )
+                .await;
+                if id.is_some() {
+                    continue;
+                }
+
                 let player_row = client
                     .query_one(
                         "
-                    INSERT INTO player_list (name, uuid)
-                    VALUES ($1, $2)
+                    INSERT INTO player_list (name, uuid, cracked)
+                    VALUES ($1, $2, $3)
                     ON CONFLICT (uuid, name) DO NOTHING
                     RETURNING id
                     ",
-                        &[&player.name, &player.id],
+                        &[
+                            &player.name,
+                            &player.id,
+                            &(name_to_uuid(&player.clone().name.unwrap())
+                                == player.clone().id.unwrap()),
+                        ],
                     )
                     .await
                     .unwrap();
@@ -522,8 +541,8 @@ pub async fn save_json(
                 let mut user_id = get_user_id(client, &name, &uuid).await;
                 if user_id.is_none() {
                     client.execute(
-                        "INSERT INTO player_list (name, uuid) VALUES ($1, $2) ON CONFLICT (uuid, name) DO NOTHING",
-                        &[&name, &uuid],
+                        "INSERT INTO player_list (name, uuid, cracked) VALUES ($1, $2, $3) ON CONFLICT (uuid, name) DO NOTHING",
+                        &[&name, &uuid, &(name_to_uuid(name) == *uuid)],
                     ).await.unwrap();
 
                     user_id = get_user_id(client, &name, &uuid).await;
@@ -539,8 +558,8 @@ pub async fn save_json(
                 let mut user_id = get_user_id(client, &name, &uuid).await;
                 if user_id.is_none() {
                     client.execute(
-                        "INSERT INTO player_list (name, uuid) VALUES ($1, $2) ON CONFLICT (uuid, name) DO NOTHING",
-                        &[&name, &uuid],
+                        "INSERT INTO player_list (name, uuid, cracked) VALUES ($1, $2, $3) ON CONFLICT (uuid, name) DO NOTHING",
+                        &[&name, &uuid, &(name_to_uuid(name) == *uuid)],
                     ).await.unwrap();
 
                     user_id = get_user_id(client, &name, &uuid).await;
@@ -577,7 +596,11 @@ pub async fn get_user_id(client: &Client, name: &str, uuid: &str) -> Option<Stri
         .await
         .unwrap();
 
-    row.map(|r| r.get(0))
+    if let Some(row) = row {
+        let id: i32 = row.get("id");
+        return Some(id.to_string());
+    }
+    None
 }
 
 fn parse_description(desc: &Value) -> String {
@@ -752,4 +775,13 @@ async fn write_last_ip(path: &str, ip: Ipv4Addr) {
         let _ = file.write_all(ip.to_string().as_bytes()).await;
         let _ = file.flush().await;
     }
+}
+
+pub fn name_to_uuid(name: &str) -> String {
+    Uuid::new_v3(
+        &Uuid::NAMESPACE_DNS,
+        format!("OfflinePlayer:{}", name).as_bytes(),
+    )
+    .as_hyphenated()
+    .to_string()
 }
