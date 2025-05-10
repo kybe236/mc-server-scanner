@@ -1,9 +1,11 @@
 use std::{
     cmp::Ordering,
+    collections::HashSet,
     io::{Error, ErrorKind, Result},
     net::Ipv4Addr,
     sync::Arc,
     time::Duration,
+    vec,
 };
 
 use ipnetwork::Ipv4Network;
@@ -19,7 +21,7 @@ use tokio::{
     sync::mpsc,
     time::timeout,
 };
-use tokio_postgres::NoTls;
+use tokio_postgres::{Client, NoTls};
 use tokio_socks::tcp::Socks5Stream;
 use tracing::{error, info};
 use tracing_subscriber::{fmt, layer::SubscriberExt};
@@ -66,7 +68,7 @@ async fn read_exclude_list(path: &str) -> Result<Vec<(u32, u32)>> {
         } else if let Ok(network) = line.parse::<Ipv4Network>() {
             let start = u32::from(network.network());
             let size = network.size();
-            let end = start + (size - 1) as u32;
+            let end = start + (size - 1);
             ranges.push((start, end));
         } else {
             error!("Invalid network format: {}", line);
@@ -322,7 +324,7 @@ async fn validate_worker(
                 continue;
             }
 
-            let ip = *folder.split(":").collect::<Vec<&str>>().get(0).unwrap();
+            let ip = *folder.split(":").collect::<Vec<&str>>().first().unwrap();
             let ip: Ipv4Addr = match ip.parse() {
                 Ok(ip) => ip,
                 Err(e) => {
@@ -362,6 +364,17 @@ struct Player {
     id: Option<String>,
 }
 
+#[derive(Debug, ToSql, FromSql)]
+#[postgres(name = "action_type")]
+pub enum ActionType {
+    #[postgres(name = "JOINED")]
+    Joined,
+    #[postgres(name = "LEFT")]
+    Left,
+    #[postgres(name = "INIT")]
+    Init,
+}
+
 pub async fn save_json(
     addr: &str,
     json_str: &str,
@@ -398,7 +411,6 @@ pub async fn save_json(
     let extra = json;
     let extra_json = serde_json::to_value(extra)?;
 
-    // Fetch the current data from the database to compare it
     let row = client
         .query_opt(
             "SELECT description, raw_description, players, version, favicon, enforces_secure_chat, extra 
@@ -408,7 +420,7 @@ pub async fn save_json(
         .await
         .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
 
-    if let Some(r) = row {
+    if let Some(r) = row.clone() {
         let current_description: String = r.get("description");
         let current_raw_description: Option<Value> = r.get("raw_description");
         let current_players: Option<Players> = r.get("players");
@@ -416,18 +428,6 @@ pub async fn save_json(
         let current_favicon: Option<String> = r.get("favicon");
         let current_enforces_secure_chat: Option<bool> = r.get("enforces_secure_chat");
         let current_extra: Value = r.get("extra");
-
-        let test1 = current_description == parsed_description.clone();
-        let test2 = current_raw_description == description;
-        let test3 = current_players == players.clone();
-        let test4 = current_version == version.clone();
-        let test5 = current_favicon == favicon;
-        let test6 = current_enforces_secure_chat == enforces_secure_chat;
-        let test7 = current_extra == extra_json.clone();
-        println!(
-            "test1: {}, test2: {}, test3: {}, test4: {}, test5: {}, test6: {}, test7: {}",
-            test1, test2, test3, test4, test5, test6, test7
-        );
 
         if current_description == parsed_description.clone()
             && current_raw_description == description
@@ -442,19 +442,20 @@ pub async fn save_json(
         }
     };
 
-    client
-        .execute(
+    let row_server = client
+        .query_one(
             "
         INSERT INTO servers (
-                ip,
-                description,
-                raw_description,
-                players, 
-                version, 
-                favicon, 
-                enforces_secure_chat, 
-                extra
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ip,
+            description,
+            raw_description,
+            players, 
+            version, 
+            favicon, 
+            enforces_secure_chat, 
+            extra
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        RETURNING id
         ",
             &[
                 &addr,
@@ -470,7 +471,113 @@ pub async fn save_json(
         .await
         .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
 
+    let server_id: i32 = row_server.get("id");
+
+    if let Some(players) = &players {
+        if let Some(sample) = &players.sample {
+            for player in sample {
+                let player_row = client
+                    .query_one(
+                        "
+                    INSERT INTO player_list (name, uuid)
+                    VALUES ($1, $2)
+                    ON CONFLICT (uuid, name) DO NOTHING
+                    RETURNING id
+                    ",
+                        &[&player.name, &player.id],
+                    )
+                    .await
+                    .unwrap();
+                if row.is_none() {
+                    let player_id: i32 = player_row.get("id");
+                    client
+                        .execute(
+                            "
+                        INSERT INTO player_actions (user_id, server_id, action)
+                        VALUES ($1, $2, $3)
+                        ",
+                            &[&player_id, &server_id, &ActionType::Init],
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    if let Some(r) = row {
+        let current_players: Option<Players> = r.get("players");
+
+        if current_players != players {
+            let old_players = extract_players(current_players.clone());
+            let new_players = extract_players(players.clone());
+
+            let old_set: HashSet<_> = old_players.iter().collect();
+            let new_set: HashSet<_> = new_players.iter().collect();
+
+            let joined = new_set.difference(&old_set);
+            let left = old_set.difference(&new_set);
+
+            for (name, uuid) in joined.cloned() {
+                let mut user_id = get_user_id(client, &name, &uuid).await;
+                if user_id.is_none() {
+                    client.execute(
+                        "INSERT INTO player_list (name, uuid) VALUES ($1, $2) ON CONFLICT (uuid, name) DO NOTHING",
+                        &[&name, &uuid],
+                    ).await.unwrap();
+
+                    user_id = get_user_id(client, &name, &uuid).await;
+                }
+
+                client.execute(
+                    "INSERT INTO player_action (user_id, server_id, action) VALUES ($1, $2, $3)",
+                    &[&user_id, &server_id,  &ActionType::Joined],
+                ).await.unwrap();
+            }
+
+            for (name, uuid) in left.cloned() {
+                let mut user_id = get_user_id(client, &name, &uuid).await;
+                if user_id.is_none() {
+                    client.execute(
+                        "INSERT INTO player_list (name, uuid) VALUES ($1, $2) ON CONFLICT (uuid, name) DO NOTHING",
+                        &[&name, &uuid],
+                    ).await.unwrap();
+
+                    user_id = get_user_id(client, &name, &uuid).await;
+                }
+
+                if let Some(_) = user_id {
+                    client.execute(
+                        "INSERT INTO player_action (user_id, server_id, action) VALUES ($1, $2, $3)",
+                        &[&user_id, &server_id,  &ActionType::Left],
+                    ).await.unwrap();
+                }
+            }
+        }
+    };
+
     Ok(())
+}
+
+fn extract_players(players: Option<Players>) -> Vec<(String, String)> {
+    players
+        .and_then(|p| p.sample)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|p| Some((p.name.clone()?, p.id.clone()?)))
+        .collect()
+}
+
+pub async fn get_user_id(client: &Client, name: &str, uuid: &str) -> Option<String> {
+    let row = client
+        .query_opt(
+            "SELECT id FROM player_list WHERE name = $1 AND uuid = $2",
+            &[&name, &uuid],
+        )
+        .await
+        .unwrap();
+
+    row.map(|r| r.get(0))
 }
 
 fn parse_description(desc: &Value) -> String {
