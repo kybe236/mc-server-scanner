@@ -2,8 +2,9 @@
     "use_tor": false,
     "cidr": "4.0.0.0/0",
     "exclude_file": "exclude.conf",
-    "worker_count": 2000,
-    "connection_timeout_secs": 10,
-    "validate": false,
-    "validate_worker_count": 1
+    "worker_count": 1,
+    "connection_timeout_secs": 3,
+    "validate": true,
+    "validate_worker_count": 10,
+    "sync_delay_secs": 600
 }

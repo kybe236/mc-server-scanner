@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     collections::HashSet,
     io::{Error, ErrorKind, Result},
-    net::Ipv4Addr,
+    net::{Ipv4Addr, SocketAddr},
     sync::Arc,
     time::Duration,
     vec,
@@ -15,10 +15,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use string::{read_string, write_string};
 use tokio::{
-    fs::{self, File},
+    fs::File,
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
-    sync::mpsc,
+    sync::{RwLock, mpsc},
     time::timeout,
 };
 use tokio_postgres::{Client, NoTls};
@@ -42,6 +42,7 @@ struct Settings {
     use_tor: bool,
     validate: bool,
     validate_worker_count: usize,
+    sync_delay_secs: u64,
 }
 
 async fn read_exclude_list(path: &str) -> Result<Vec<(u32, u32)>> {
@@ -190,7 +191,7 @@ async fn main() {
     });
 
     let (client, connection) = tokio_postgres::connect(
-        "host=localhost user=mcscanner_user dbname=mcscanner password=pwd",
+        "host=localhost user=mcscanner_user dbname=mcscanner password=MCSCANNER2306",
         NoTls,
     )
     .await
@@ -243,28 +244,74 @@ async fn main() {
     };
 
     if settings.validate {
+        let ips = Arc::new(RwLock::new(get_ip_from_server(&client).await));
+        let sync_client = Arc::clone(&client);
+        let sync_settings = settings.clone();
+        let ips_clone = Arc::clone(&ips);
+        tokio::spawn(async move {
+            *ips_clone.write().await = get_ip_from_server(&sync_client).await;
+            let delay = Duration::from_secs(sync_settings.sync_delay_secs);
+            loop {
+                tokio::time::sleep(delay).await;
+                *ips_clone.write().await = get_ip_from_server(&sync_client).await;
+            }
+        });
+
         let client = Arc::clone(&client);
+        let all_ips = Arc::clone(&ips);
+        let worker_count = settings.validate_worker_count;
         let validate_handles = tokio::spawn(async move {
             let mut handles = Vec::new();
-            for i in 0..settings.validate_worker_count {
+            for i in 0..worker_count {
                 let s = settings.clone();
+                let client = Arc::clone(&client);
                 handles.push(tokio::spawn(validate_worker(
                     i,
-                    s.validate_worker_count,
+                    worker_count,
                     s,
-                    client.clone(),
+                    client,
+                    all_ips.clone(),
                 )));
             }
+
             for h in handles {
                 let _ = h.await;
             }
         });
+
         let _ = validate_handles.await;
     }
 
     // Wait for both tasks
     let _ = producer_handle.await;
     let _ = worker_handle.await;
+}
+
+pub async fn get_ip_from_server(client: &Client) -> Vec<(Ipv4Addr, u16)> {
+    let rows = client
+        .query("SELECT DISTINCT ip FROM servers", &[])
+        .await
+        .expect("Failed to fetch IPs");
+
+    let mut unique_ips = HashSet::new();
+
+    for row in rows {
+        let ip_str: String = row.get("ip");
+
+        match ip_str.parse::<SocketAddr>() {
+            Ok(socket_addr) => {
+                if let std::net::IpAddr::V4(ipv4) = socket_addr.ip() {
+                    unique_ips.insert((ipv4, socket_addr.port()));
+                }
+            }
+            Err(e) => {
+                error!("Invalid socket address '{}': {}", ip_str, e);
+                continue;
+            }
+        }
+    }
+
+    unique_ips.into_iter().collect()
 }
 
 async fn check_ip(
@@ -297,47 +344,24 @@ async fn check_ip(
 }
 
 async fn validate_worker(
-    id: usize,
+    worker_id: usize,
     total: usize,
     settings: Settings,
     client: Arc<tokio_postgres::Client>,
+    ips: Arc<RwLock<Vec<(Ipv4Addr, u16)>>>,
 ) {
     loop {
-        let dir = match fs::read_dir("res").await {
-            Ok(d) => d,
-            Err(e) => {
-                error!("Validator {} failed to read ./res: {}", id, e);
-                return;
-            }
-        };
-
-        tokio::pin!(dir);
-        while let Some(entry) = dir.next_entry().await.unwrap_or(None) {
-            info!(
-                "Validator {}: checking {}",
-                id,
-                entry.file_name().to_string_lossy()
-            );
-            let folder = entry.file_name().to_string_lossy().into_owned();
-
-            let sum: usize = folder.bytes().map(|b| b as usize).sum();
-            if sum % total != id {
+        let ips_clone = ips.read().await.clone();
+        for (id, ip) in ips_clone.iter().enumerate() {
+            if id % total != worker_id {
                 continue;
             }
+            info!("Validator {}: checking {}", id, ip.0.to_string());
 
-            let ip = *folder.split(":").collect::<Vec<&str>>().first().unwrap();
-            let ip: Ipv4Addr = match ip.parse() {
-                Ok(ip) => ip,
-                Err(e) => {
-                    error!("Validator {}: invalid IP {}: {}", id, ip, e);
-                    continue;
-                }
-            };
-
-            check_ip(ip, &settings, &client)
+            check_ip(ip.0, &settings, &client)
                 .await
                 .unwrap_or_else(|e: Error| {
-                    error!("Validator {}: error checking IP {}: {}", id, folder, e);
+                    error!("Validator {}: error checking IP {}: {}", id, ip.0, e);
                 });
         }
     }
@@ -480,12 +504,14 @@ pub async fn save_json(
                 if player.name.is_none() || player.id.is_none() {
                     continue;
                 }
+
                 let id = get_user_id(
-                    &client,
+                    client,
                     &player.name.clone().unwrap(),
                     &player.id.clone().unwrap(),
                 )
                 .await;
+
                 if id.is_some() {
                     continue;
                 }
@@ -507,6 +533,7 @@ pub async fn save_json(
                     )
                     .await
                     .unwrap();
+
                 if row.is_none() {
                     let player_id: i32 = player_row.get("id");
                     client
@@ -538,36 +565,53 @@ pub async fn save_json(
             let left = old_set.difference(&new_set);
 
             for (name, uuid) in joined.cloned() {
-                let mut user_id = get_user_id(client, &name, &uuid).await;
+                let mut user_id = get_user_id(client, name, uuid).await;
                 if user_id.is_none() {
-                    client.execute(
-                        "INSERT INTO player_list (name, uuid, cracked) VALUES ($1, $2, $3) ON CONFLICT (uuid, name) DO NOTHING",
-                        &[&name, &uuid, &(name_to_uuid(name) == *uuid)],
-                    ).await.unwrap();
+                    let row = client
+                        .query_one(
+                            "
+                        INSERT INTO player_list (name, uuid, cracked)
+                        VALUES ($1, $2, $3)
+                        ON CONFLICT (uuid, name) DO NOTHING
+                        RETURNING id
+                        ",
+                            &[&name, &uuid, &(name_to_uuid(name) == *uuid)],
+                        )
+                        .await
+                        .unwrap();
 
-                    user_id = get_user_id(client, &name, &uuid).await;
+                    user_id = Some(row.get("id"));
                 }
 
-                client.execute(
-                    "INSERT INTO player_action (user_id, server_id, action) VALUES ($1, $2, $3)",
-                    &[&user_id, &server_id,  &ActionType::Joined],
-                ).await.unwrap();
+                if let Some(user_id) = user_id {
+                    client.execute(
+                        "INSERT INTO player_actions (user_id, server_id, action) VALUES ($1, $2, $3)",
+                        &[&user_id, &server_id,  &ActionType::Joined],
+                    ).await.unwrap();
+                }
             }
 
             for (name, uuid) in left.cloned() {
-                let mut user_id = get_user_id(client, &name, &uuid).await;
+                let mut user_id = get_user_id(client, name, uuid).await;
                 if user_id.is_none() {
-                    client.execute(
-                        "INSERT INTO player_list (name, uuid, cracked) VALUES ($1, $2, $3) ON CONFLICT (uuid, name) DO NOTHING",
-                        &[&name, &uuid, &(name_to_uuid(name) == *uuid)],
-                    ).await.unwrap();
+                    let row = client
+                        .query_one(
+                            "
+                        INSERT INTO player_list (name, uuid, cracked)
+                        VALUES ($1, $2, $3) ON CONFLICT (uuid, name) DO NOTHING
+                        RETURNING id                        
+                        ",
+                            &[&name, &uuid, &(name_to_uuid(name) == *uuid)],
+                        )
+                        .await
+                        .unwrap();
 
-                    user_id = get_user_id(client, &name, &uuid).await;
+                    user_id = Some(row.get("id"));
                 }
 
-                if let Some(_) = user_id {
+                if let Some(user_id) = user_id {
                     client.execute(
-                        "INSERT INTO player_action (user_id, server_id, action) VALUES ($1, $2, $3)",
+                        "INSERT INTO player_actions (user_id, server_id, action) VALUES ($1, $2, $3)",
                         &[&user_id, &server_id,  &ActionType::Left],
                     ).await.unwrap();
                 }
@@ -587,7 +631,7 @@ fn extract_players(players: Option<Players>) -> Vec<(String, String)> {
         .collect()
 }
 
-pub async fn get_user_id(client: &Client, name: &str, uuid: &str) -> Option<String> {
+pub async fn get_user_id(client: &Client, name: &str, uuid: &str) -> Option<i32> {
     let row = client
         .query_opt(
             "SELECT id FROM player_list WHERE name = $1 AND uuid = $2",
@@ -598,8 +642,9 @@ pub async fn get_user_id(client: &Client, name: &str, uuid: &str) -> Option<Stri
 
     if let Some(row) = row {
         let id: i32 = row.get("id");
-        return Some(id.to_string());
+        return Some(id);
     }
+
     None
 }
 
