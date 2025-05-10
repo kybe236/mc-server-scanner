@@ -777,11 +777,11 @@ async fn write_last_ip(path: &str, ip: Ipv4Addr) {
     }
 }
 
-pub fn name_to_uuid(name: &str) -> String {
-    Uuid::new_v3(
-        &Uuid::NAMESPACE_DNS,
-        format!("OfflinePlayer:{}", name).as_bytes(),
-    )
-    .as_hyphenated()
-    .to_string()
+pub fn name_to_uuid(username: &str) -> String {
+    let mut hash = md5::compute(format!("OfflinePlayer:{}", username)).0;
+    hash[6] = hash[6] & 0x0f | 0x30; // uuid version 3
+    hash[8] = hash[8] & 0x3f | 0x80; // RFC4122 variant
+
+    let uuid = Uuid::from_bytes(hash);
+    uuid.to_string()
 }
