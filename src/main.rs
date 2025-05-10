@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::HashSet,
+    hash::{Hash, Hasher},
     io::{Error, ErrorKind, Result},
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
@@ -374,7 +375,7 @@ struct Version {
     protocol: Option<i32>,
 }
 
-#[derive(ToSql, FromSql, Debug, Clone, PartialEq, Eq)]
+#[derive(ToSql, FromSql, Debug, Clone)]
 #[postgres(name = "players")]
 struct Players {
     max: Option<i32>,
@@ -382,11 +383,36 @@ struct Players {
     sample: Option<Vec<Player>>,
 }
 
+impl PartialEq for Players {
+    fn eq(&self, other: &Self) -> bool {
+        self.max == other.max
+            && self.online == other.online
+            && match (&self.sample, &other.sample) {
+                (Some(a), Some(b)) => {
+                    let sa: HashSet<_> = a.iter().collect();
+                    let sb: HashSet<_> = b.iter().collect();
+                    sa == sb
+                }
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for Players {}
+
 #[derive(ToSql, FromSql, Debug, Clone, PartialEq, Eq)]
 #[postgres(name = "player")]
 struct Player {
     name: Option<String>,
     id: Option<String>,
+}
+
+impl Hash for Player {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+        self.id.hash(state);
+    }
 }
 
 #[derive(Debug, ToSql, FromSql)]
