@@ -2,13 +2,12 @@ use std::{
     cmp::Ordering,
     io::{Error, ErrorKind, Result},
     net::Ipv4Addr,
-    path::Path,
     sync::Arc,
     time::Duration,
 };
 
-use chrono::Local;
 use ipnetwork::Ipv4Network;
+use postgres_types::{FromSql, ToSql};
 use rand::{Rng, distr::Alphanumeric};
 use serde::Deserialize;
 use serde_json::Value;
@@ -20,6 +19,7 @@ use tokio::{
     sync::mpsc,
     time::timeout,
 };
+use tokio_postgres::NoTls;
 use tokio_socks::tcp::Socks5Stream;
 use tracing::{error, info};
 use tracing_subscriber::{fmt, layer::SubscriberExt};
@@ -186,9 +186,25 @@ async fn main() {
         }
     });
 
+    let (client, connection) = tokio_postgres::connect(
+        "host=localhost user=mcscanner_user dbname=mcscanner password=pwd",
+        NoTls,
+    )
+    .await
+    .unwrap();
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            error!("Connection error: {}", e);
+        }
+    });
+
+    let client = Arc::new(client);
+
     // Consumer (worker) tasks
     let worker_handle = {
         let settings = settings.clone();
+        let client = Arc::clone(&client);
         tokio::spawn(async move {
             let mut handles = Vec::new();
             let rx = Arc::new(tokio::sync::Mutex::new(rx)); // share receiver safely
@@ -196,6 +212,7 @@ async fn main() {
             for _ in 0..settings.worker_count {
                 let rx = Arc::clone(&rx);
                 let settings = settings.clone();
+                let client = Arc::clone(&client);
                 let handle = tokio::spawn(async move {
                     loop {
                         let ip = {
@@ -204,7 +221,7 @@ async fn main() {
                         };
                         match ip {
                             Some(ip) => {
-                                check_ip(ip, &settings).await.unwrap_or_else(|e| {
+                                check_ip(ip, &settings, &client).await.unwrap_or_else(|e| {
                                     error!("Error checking IP {}: {}", ip, e);
                                 });
                             }
@@ -223,11 +240,17 @@ async fn main() {
     };
 
     if settings.validate {
+        let client = Arc::clone(&client);
         let validate_handles = tokio::spawn(async move {
             let mut handles = Vec::new();
             for i in 0..settings.validate_worker_count {
                 let s = settings.clone();
-                handles.push(tokio::spawn(validate_worker(i, s.validate_worker_count, s)));
+                handles.push(tokio::spawn(validate_worker(
+                    i,
+                    s.validate_worker_count,
+                    s,
+                    client.clone(),
+                )));
             }
             for h in handles {
                 let _ = h.await;
@@ -241,7 +264,11 @@ async fn main() {
     let _ = worker_handle.await;
 }
 
-async fn check_ip(ip: Ipv4Addr, settings: &Settings) -> Result<()> {
+async fn check_ip(
+    ip: Ipv4Addr,
+    settings: &Settings,
+    client: &tokio_postgres::Client,
+) -> Result<()> {
     let addr = format!("{}:25565", ip);
     info!("Connecting to {}", addr);
     let timeout_dur = Duration::from_secs(settings.connection_timeout_secs);
@@ -263,10 +290,15 @@ async fn check_ip(ip: Ipv4Addr, settings: &Settings) -> Result<()> {
     let response = read_string(&buffer, &mut index);
     info!("{}: Code {:?}, Response {:?}", addr, code, response);
 
-    save_json_to_file(&addr, &response.unwrap_or_default()).await
+    save_json(&addr, &response.unwrap_or_default(), client).await
 }
 
-async fn validate_worker(id: usize, total: usize, settings: Settings) {
+async fn validate_worker(
+    id: usize,
+    total: usize,
+    settings: Settings,
+    client: Arc<tokio_postgres::Client>,
+) {
     loop {
         let dir = match fs::read_dir("res").await {
             Ok(d) => d,
@@ -299,42 +331,225 @@ async fn validate_worker(id: usize, total: usize, settings: Settings) {
                 }
             };
 
-            check_ip(ip, &settings).await.unwrap_or_else(|e: Error| {
-                error!("Validator {}: error checking IP {}: {}", id, folder, e);
-            });
+            check_ip(ip, &settings, &client)
+                .await
+                .unwrap_or_else(|e: Error| {
+                    error!("Validator {}: error checking IP {}: {}", id, folder, e);
+                });
         }
     }
 }
 
-pub async fn save_json_to_file(addr: &str, json_str: &str) -> Result<()> {
-    let parsed: Value = serde_json::from_str(json_str)
+#[derive(ToSql, FromSql, Debug, Clone, PartialEq, Eq)]
+#[postgres(name = "version")]
+struct Version {
+    name: Option<String>,
+    protocol: Option<i32>,
+}
+
+#[derive(ToSql, FromSql, Debug, Clone, PartialEq, Eq)]
+#[postgres(name = "players")]
+struct Players {
+    max: Option<i32>,
+    online: Option<i32>,
+    sample: Option<Vec<Player>>,
+}
+
+#[derive(ToSql, FromSql, Debug, Clone, PartialEq, Eq)]
+#[postgres(name = "player")]
+struct Player {
+    name: Option<String>,
+    id: Option<String>,
+}
+
+pub async fn save_json(
+    addr: &str,
+    json_str: &str,
+    client: &tokio_postgres::Client,
+) -> std::io::Result<()> {
+    use serde_json::Value;
+    use std::io::{Error, ErrorKind};
+
+    let json_str = json_str.replace("\\u0000", "").replace("\u{0000}", "");
+    let mut json: Value = serde_json::from_str(&json_str)
         .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Invalid JSON: {}", e)))?;
 
-    let formatted = serde_json::to_string_pretty(&parsed)
-        .map_err(|e| Error::new(ErrorKind::Other, format!("Failed to format JSON: {}", e)))?;
+    let description = json.get("description").cloned();
+    json.as_object_mut().map(|obj| obj.remove("description"));
 
-    let foldername = format!("res/{}", addr);
-    let dir = Path::new(&foldername);
-    if !dir.exists() {
-        fs::create_dir_all(dir).await?;
+    let parsed_description = parse_description(&description.clone().unwrap_or_default());
+
+    let enforces_secure_chat = json.get("enforcesSecureChat").and_then(|v| v.as_bool());
+    json.as_object_mut()
+        .map(|obj| obj.remove("enforcesSecureChat"));
+
+    let favicon = json
+        .get("favicon")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    json.as_object_mut().map(|obj| obj.remove("favicon"));
+
+    let players = json.get("players").map(parse_players);
+    json.as_object_mut().map(|obj| obj.remove("players"));
+    let version = json.get("version").map(parse_version);
+    json.as_object_mut().map(|obj| obj.remove("version"));
+
+    let extra = json;
+    let extra_json = serde_json::to_value(extra)?;
+
+    // Fetch the current data from the database to compare it
+    let row = client
+        .query_opt(
+            "SELECT description, raw_description, players, version, favicon, enforces_secure_chat, extra 
+            FROM servers WHERE ip = $1 ORDER BY id DESC LIMIT 1;",
+            &[&addr],
+        )
+        .await
+        .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+
+    if let Some(r) = row {
+        let current_description: String = r.get("description");
+        let current_raw_description: Option<Value> = r.get("raw_description");
+        let current_players: Option<Players> = r.get("players");
+        let current_version: Option<Version> = r.get("version");
+        let current_favicon: Option<String> = r.get("favicon");
+        let current_enforces_secure_chat: Option<bool> = r.get("enforces_secure_chat");
+        let current_extra: Value = r.get("extra");
+
+        let test1 = current_description == parsed_description.clone();
+        let test2 = current_raw_description == description;
+        let test3 = current_players == players.clone();
+        let test4 = current_version == version.clone();
+        let test5 = current_favicon == favicon;
+        let test6 = current_enforces_secure_chat == enforces_secure_chat;
+        let test7 = current_extra == extra_json.clone();
+        println!(
+            "test1: {}, test2: {}, test3: {}, test4: {}, test5: {}, test6: {}, test7: {}",
+            test1, test2, test3, test4, test5, test6, test7
+        );
+
+        if current_description == parsed_description.clone()
+            && current_raw_description == description
+            && current_players == players.clone()
+            && current_version == version.clone()
+            && current_favicon == favicon
+            && current_enforces_secure_chat == enforces_secure_chat
+            && current_extra == extra_json.clone()
+        {
+            info!("{}: No changes detected, skipping insert", addr);
+            return Ok(());
+        }
+    };
+
+    client
+        .execute(
+            "
+        INSERT INTO servers (
+                ip,
+                description,
+                raw_description,
+                players, 
+                version, 
+                favicon, 
+                enforces_secure_chat, 
+                extra
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ",
+            &[
+                &addr,
+                &parsed_description,
+                &description,
+                &players,
+                &version,
+                &favicon,
+                &enforces_secure_chat,
+                &extra_json,
+            ],
+        )
+        .await
+        .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+
+    Ok(())
+}
+
+fn parse_description(desc: &Value) -> String {
+    match desc {
+        Value::String(s) => s.clone(),
+        Value::Array(arr) => {
+            let mut result = String::new();
+            for item in arr {
+                if let Some(Value::String(text)) = item.get("text") {
+                    result.push_str(text);
+                }
+            }
+            result
+        }
+        Value::Object(map) => {
+            let mut result = String::new();
+
+            if let Some(Value::String(text)) = map.get("text") {
+                result.push_str(text);
+            }
+
+            if let Some(Value::Array(extra)) = map.get("extra") {
+                for item in extra {
+                    if let Some(Value::String(text)) = item.get("text") {
+                        result.push_str(text);
+                    }
+                }
+            }
+
+            result
+        }
+        _ => "".to_string(),
+    }
+}
+
+fn parse_players(players: &Value) -> Players {
+    let max = players
+        .get("max")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
+    let online = players
+        .get("online")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
+    let sample = players.get("sample").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .map(|item| Player {
+                name: item
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                id: item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+            })
+            .collect()
+    });
+
+    Players {
+        max,
+        online,
+        sample,
+    }
+}
+
+fn parse_version(version: &Value) -> Version {
+    let mut name = None;
+    let mut protocol = None;
+
+    if let Some(Value::String(v)) = version.get("name") {
+        name = Some(v.clone());
     }
 
-    let now = Local::now();
-    let filename = format!("{}/{}.json", foldername, now.format("%Y-%m-%d_%H-%M-%S"));
-    let latest_filename = format!("{}/latest.json", foldername);
+    if let Some(Value::Number(v)) = version.get("protocol") {
+        protocol = v.as_i64().map(|v| v as i32);
+    }
 
-    // Write the timestamped file
-    let mut file = File::create(&filename).await?;
-    file.write_all(formatted.as_bytes()).await?;
-    file.flush().await?;
-
-    // Also write the latest.json file
-    let mut latest_file = File::create(&latest_filename).await?;
-    latest_file.write_all(formatted.as_bytes()).await?;
-    latest_file.flush().await?;
-
-    info!("Saved response to {}", filename);
-    Ok(())
+    Version { name, protocol }
 }
 
 async fn create_handshake_packet(
